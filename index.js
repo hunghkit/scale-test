@@ -1,71 +1,201 @@
 const { SerialPort } = require('serialport');
-const { ReadlineParser } = require('@serialport/parser-readline');
+
 
 const PORT_NAME = 'COM4'; // Đổi thành cổng COM thực tế của bạn (hoặc /dev/ttyUSB0)
 
 // const PORT_NAME = '/dev/cu.wchusbserial130'; // For macos
+// const PORT_NAME = '/dev/cu.wchusbserial130';
 
+// Khởi tạo cổng kết nối
 const port = new SerialPort({
   path: PORT_NAME,
   baudRate: 9600,
-  dataBits: 8,      // Nếu nhận chuỗi rác, thử đổi thành: 7
-  parity: 'none',   // Nếu nhận chuỗi rác, thử đổi thành: 'odd'
+  dataBits: 8,      // Thử đổi sang 7 nếu máy quét cài profile NCR
+  parity: 'none',   // Thử đổi sang 'odd' nếu máy quét cài profile NCR
   stopBits: 1,
+  rtscts: false,    // Điều khiển luồng bằng tay qua DTR/RTS
+  autoOpen: false,
 });
 
-// Gói tin Magellan 9800i thường kết thúc bằng CR (\r)
-const parser = port.pipe(new ReadlineParser({ delimiter: '\r' }));
+// ==========================================================
+// 1. CÁC HÀM ĐIỀU KHIỂN (LIFECYCLE: CLAIM, ENABLE, RELEASE)
+// ==========================================================
 
-// 1. Khi mở cổng thành công
-port.on('open', () => {
-  console.log(`=== ĐÃ KẾT NỐI THÀNH CÔNG VỚI ${PORT_NAME} (9600, 8-N-1) ===`);
-  console.log('-> Quét mã vạch: đưa sản phẩm qua kính quét.');
-  console.log('-> Đọc cân: nhấn Enter trên bàn phím.');
-  console.log('-> Zero cân: gõ "z" rồi nhấn Enter.');
-  console.log('------------------------------------------------------------');
-});
+// CLAIM: Giành quyền điều khiển độc quyền bằng cách kích hoạt chân phần cứng DTR/RTS
+function claimDevice() {
+  return new Promise((resolve, reject) => {
+    port.set({ dtr: true, rts: true }, (err) => {
+      if (err) return reject(err);
+      console.log('🔒 [CLAIM] Đã chiếm quyền kết nối phần cứng (DTR/RTS = HIGH)');
+      resolve();
+    });
+  });
+}
 
-// 2. console.log toàn bộ dữ liệu nhận về từ máy 9800i
-parser.on('data', (raw) => {
-  const data = raw.trim();
-  if (!data) return;
-
-  console.log('\n--- NHẬN ĐƯỢC GÓI TIN MỚI ---');
-  console.log('Dữ liệu dạng Text :', data);
-  console.log('Dữ liệu dạng Hex  :', Buffer.from(data).toString('hex'));
-
-  // Kiểm tra phân luồng SCRS-232
-  if (data.startsWith('S')) {
-    console.log('[LOẠI GÓI TIN]    : CÂN (SCALE)');
-    console.log('Mã trạng thái     :', data.substring(1, 3));
-    console.log('Khối lượng thô    :', data.substring(3, 8));
-    
-    // Nếu trạng thái là 11 (cân ổn định)
-    if (data.substring(1, 3) === '11') {
-      const kg = parseInt(data.substring(3, 8), 10) / 1000;
-      console.log('=> KHỐI LƯỢNG THỰC:', kg, 'kg');
+// ENABLE: Bật cân (Weight) và bật mắt đọc (Scanner)
+function enableWeightAndScanner() {
+  // 0x11 (DC1): Bật cân (Scale Enable)
+  // 0x12 (DC2): Bật mắt đọc (Scanner Enable)
+  const enableBuffer = Buffer.from([0x11, 0x12]);
+  
+  port.write(enableBuffer, (err) => {
+    if (err) {
+      console.error('❌ [ENABLE] Thất bại:', err.message);
+    } else {
+      console.log('⚡ [ENABLE] Đã kích hoạt Cân (0x11) & Mắt đọc (0x12)');
     }
+  });
+}
+
+// READ WEIGHT: Gửi lệnh yêu cầu đọc số cân
+function requestWeight() {
+  console.log('>> [REQUEST WEIGHT] Đang gửi lệnh "W\\r" (57 0d)...');
+  port.write('W\r');
+}
+
+// ZERO SCALE: Gửi lệnh đưa bàn cân về 0.000 kg
+function zeroScale() {
+  console.log('>> [ZERO] Đang gửi lệnh Zero "Z\\r" (5a 0d)...');
+  port.write('Z\r');
+}
+
+// RELEASE: Khóa thiết bị và nhả quyền khi tắt ứng dụng / thoát ca
+function releaseDevice() {
+  console.log('\n🛑 [RELEASE] Đang ngắt kết nối và nhả quyền...');
+  
+  // 0x13 (DC3): Tắt cân
+  // 0x14 (DC4): Tắt mắt đọc
+  const disableBuffer = Buffer.from([0x13, 0x14]);
+  
+  port.write(disableBuffer, () => {
+    port.set({ dtr: false, rts: false }, () => {
+      console.log('🔓 [RELEASE] Đã hạ DTR/RTS = LOW. Đóng cổng.');
+      port.close(() => process.exit(0));
+    });
+  });
+}
+
+// ==========================================================
+// 2. KHỞI CHẠY KẾT NỐI VÀ TỰ ĐỘNG CLAIM + ENABLE
+// ==========================================================
+
+port.open(async (err) => {
+  if (err) {
+    console.error(`❌ Không thể mở cổng ${PORT_NAME}:`, err.message);
+    return;
+  }
+
+  console.log(`\n======================================================`);
+  console.log(`✅ ĐÃ MỞ CỔNG: ${PORT_NAME} (9600 - 8 - N - 1)`);
+  console.log(`======================================================`);
+
+  try {
+    // Bước 1: Chiếm quyền thiết bị
+    await claimDevice();
+    
+    // Bước 2: Kích hoạt Cân & Mắt đọc (delay nhẹ 200ms để cân ổn định)
+    setTimeout(() => {
+      enableWeightAndScanner();
+    }, 200);
+
+  } catch (error) {
+    console.error('Lỗi khi Claim/Enable:', error.message);
+  }
+
+  console.log(`\n👉 HƯỚNG DẪN TEST:`);
+  console.log(`   - Quét mã vạch : Đưa sản phẩm qua mắt đọc.`);
+  console.log(`   - Nhấn [Enter] : Gửi lệnh đọc cân ("W\\r").`);
+  console.log(`   - Nhấn [e]     : Gửi lại lệnh ENABLE Cân & Scanner.`);
+  console.log(`   - Nhấn [z]     : Gửi lệnh Zero cân.`);
+  console.log(`   - Nhấn [q]     : RELEASE và thoát chương trình.`);
+  console.log(`======================================================\n`);
+});
+
+// ==========================================================
+// 3. XỬ LÝ VÀ PHÂN LUỒNG DỮ LIỆU NHẬN VỀ
+// ==========================================================
+
+port.on('data', (buffer) => {
+  const hex = buffer.toString('hex');
+  const text = buffer.toString('ascii').trim();
+
+  console.log('\n📥 [DỮ LIỆU ĐẾN]');
+  console.log('   Raw Hex :', hex);
+  console.log('   Raw Text:', text);
+
+  // Phân luồng Single-Cable RS-232:
+  // Gói tin cân của Magellan luôn bắt đầu bằng ký tự 'S'
+  if (text.startsWith('S')) {
+    parseScalePacket(text);
   } else {
-    console.log('[LOẠI GÓI TIN]    : MÃ VẠCH (BARCODE)');
-    console.log('=> MÃ QUÉT ĐƯỢC   :', data);
+    // Nếu không bắt đầu bằng 'S', đây là dữ liệu Barcode
+    console.log(`🏷️  [BARCODE] : ${text}`);
   }
 });
 
-// 3. Nhận phím từ terminal để gửi lệnh thử nghiệm xuống cân
+// Giải mã gói tin cân: S + Status (2 ký tự) + Weight (5 ký tự)
+function parseScalePacket(packet) {
+  const status = packet.substring(1, 3);
+  const rawWeight = packet.substring(3, 8);
+
+  switch (status) {
+    case '11': {
+      // Trạng thái cân ổn định
+      const weightKg = parseInt(rawWeight, 10) / 1000;
+      console.log(`⚖️  [CÂN ỔN ĐỊNH] Khối lượng: ${weightKg.toFixed(3)} kg`);
+      break;
+    }
+    case '12':
+      console.log(`⚠️  [CÂN DAO ĐỘNG] Cân đang rung lắc, chưa ổn định.`);
+      break;
+    case '13':
+      console.log(`⚠️  [LỖI CÂN] Cân âm bàn (Under zero) -> Hãy gõ 'z' để Zero bàn cân.`);
+      break;
+    case '14':
+      console.log(`⚠️  [LỖI CÂN] Cân quá tải trọng (Over capacity).`);
+      break;
+    case '15':
+      console.log(`⚖️  [CÂN ZERO] Mặt bàn cân đang ở mức chuẩn 0.000 kg.`);
+      break;
+    default:
+      console.log(`ℹ️  [MÃ CÂN KHÁC] Status: ${status}, Data: ${packet}`);
+  }
+}
+
+// ==========================================================
+// 4. BẮT SỰ KIỆN TỪ TERMINAL
+// ==========================================================
+
 process.stdin.setEncoding('utf-8');
 process.stdin.on('data', (input) => {
-  const cmd = input.trim().toLowerCase();
+  const key = input.trim().toLowerCase();
 
-  if (cmd === 'z') {
-    console.log('>> [GỬI LỆNH] Zero cân (Z\\r)...');
-    port.write('Z\r');
-  } else {
-    console.log('>> [GỬI LỆNH] Đọc cân (W\\r)...');
-    port.write('W\r');
+  if (!port.isOpen) return;
+
+  switch (key) {
+    case 'w':
+    case '': // Bấm Enter không cũng đọc cân
+      requestWeight();
+      break;
+    case 'e':
+      enableWeightAndScanner();
+      break;
+    case 'z':
+      zeroScale();
+      break;
+    case 'q':
+      releaseDevice();
+      break;
+    default:
+      console.log(`Phím '${key}' không hợp lệ. Nhấn Enter (đọc cân), 'z' (zero), 'q' (thoát).`);
   }
 });
 
-// Bắt lỗi nếu không mở được cổng
+// Bắt sự kiện Ctrl + C để luôn Release sạch sẽ trước khi tắt
+process.on('SIGINT', () => {
+  releaseDevice();
+});
+
 port.on('error', (err) => {
-  console.error('LỖI CỔNG COM:', err.message);
+  console.error('❌ Lỗi cổng Serial:', err.message);
 });
